@@ -237,67 +237,235 @@ function cleanDescription(description: string): string {
     .slice(0, 255)
 }
 
+// Month abbreviation → number map (used for short-date parsing)
+const MONTH_MAP: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+  january: 1, february: 2, march: 3, april: 4, june: 6, july: 7,
+  august: 8, september: 9, october: 10, november: 11, december: 12,
+}
+
+// Keywords that strongly suggest income — used when we can't infer from balance delta
+const INCOME_KEYWORDS = [
+  "payroll", "salary", "direct dep", "deposit", "e-transfer rec", "etransfer rec",
+  "preauth credit", "preauthorized credit", "paycheck", "dividend", "interest earned",
+  "refund", "rebate", "cashback", "tax return", "government", "ei ", "cpp ", "oas ",
+  "cerb", "cra credit", "child benefit", "income",
+]
+
+function isIncomeByKeyword(desc: string): boolean {
+  const lower = desc.toLowerCase()
+  return INCOME_KEYWORDS.some((kw) => lower.includes(kw))
+}
+
 /**
- * Parse a PDF bank statement by extracting transaction rows from raw text.
- * Handles most major bank PDF formats by looking for date + amount patterns.
+ * Parse a short date like "Jan 02", "02 Jan", or "01/15" (no year).
+ * Falls back to the statement year or current year.
+ */
+function parseShortDate(dateStr: string, year: number): string | null {
+  // "Jan 02" or "Jan. 02"
+  const md = dateStr.match(
+    /^(jan\.?|feb\.?|mar\.?|apr\.?|may\.?|jun\.?|jul\.?|aug\.?|sep\.?|oct\.?|nov\.?|dec\.?|january|february|march|april|june|july|august|september|october|november|december)\s+(\d{1,2})$/i
+  )
+  if (md) {
+    const month = MONTH_MAP[md[1].toLowerCase().replace(/\.$/, "")]
+    const day = parseInt(md[2])
+    if (month && day >= 1 && day <= 31)
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+  }
+
+  // "02 Jan"
+  const dm = dateStr.match(/^(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)$/i)
+  if (dm) {
+    const day = parseInt(dm[1])
+    const month = MONTH_MAP[dm[2].toLowerCase()]
+    if (month && day >= 1 && day <= 31)
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+  }
+
+  // "01/15" or "1/15" (MM/DD, no year)
+  const mmdd = dateStr.match(/^(\d{1,2})\/(\d{1,2})$/)
+  if (mmdd) {
+    const month = parseInt(mmdd[1])
+    const day = parseInt(mmdd[2])
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31)
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+  }
+
+  return null
+}
+
+/**
+ * Parse a PDF bank statement.
+ *
+ * Strategy:
+ * 1. Extract all lines that contain a recognisable date + at least one dollar amount.
+ * 2. When a line has 2+ amounts the LAST is treated as the running balance,
+ *    the SECOND-TO-LAST as the transaction amount.  When only 1 amount is found
+ *    it is the transaction amount (no balance column, or balance was on separate line).
+ * 3. Transaction direction (income vs expense) is inferred from consecutive
+ *    balance deltas.  When that's not available we fall back to keyword matching.
  */
 export function parsePDFStatement(text: string): ParsedTransaction[] {
-  const transactions: ParsedTransaction[] = []
-
-  // Normalise line endings and split
   const lines = text.replace(/\r\n/g, "\n").split("\n")
+  const currentYear = new Date().getFullYear()
 
-  // Regex patterns
-  // Date: MM/DD/YYYY, YYYY-MM-DD, MM-DD-YYYY, Jan 01 2024, Jan 01/24
-  const datePattern =
-    /\b(\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}[,\s]+\d{4})\b/i
+  // Try to detect the statement year from a 4-digit year in the first 800 chars
+  const yearMatch = text.slice(0, 800).match(/\b(20\d{2})\b/)
+  const stmtYear = yearMatch ? parseInt(yearMatch[1]) : currentYear
 
-  // Amount: $1,234.56 or -1,234.56 or 1,234.56 CR/DR
-  const amountPattern = /(?:\$\s*)?-?[\d,]+\.\d{2}(?:\s*(?:CR|DR))?/gi
+  // All date patterns, ordered most-specific first
+  const DATE_PATTERNS: Array<{ re: RegExp; short: boolean }> = [
+    { re: /\b(\d{4}-\d{2}-\d{2})\b/, short: false },
+    { re: /\b(\d{1,2}\/\d{1,2}\/\d{2,4})\b/, short: false },
+    { re: /\b(\d{1,2}-\d{1,2}-\d{4})\b/, short: false },
+    {
+      re: /\b((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2},?\s+\d{4})\b/i,
+      short: false,
+    },
+    {
+      re: /\b(\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?),?\s+\d{4})\b/i,
+      short: false,
+    },
+    // Short dates (no year) — common in Scotiabank, TD, RBC statements
+    {
+      re: /\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2})\b/i,
+      short: true,
+    },
+    { re: /\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))\b/i, short: true },
+    { re: /\b(\d{2}\/\d{2})\b/, short: true },
+  ]
+
+  // Matches a money amount: optional $, digits with optional commas, decimal cents,
+  // optional trailing - or + or CR/DR suffix.
+  const AMOUNT_RE = /\$?\s*[\d,]+\.\d{2}\s*(?:[-+]|CR|DR)?/gi
+
+  interface RawEntry {
+    date: string
+    description: string
+    txAmount: number        // transaction amount (always positive here)
+    balance: number | null  // running balance if available
+    hasCR: boolean          // explicit credit indicator
+    hasDR: boolean          // explicit debit indicator
+    hasTrailingMinus: boolean
+  }
+
+  const raw: RawEntry[] = []
 
   for (const line of lines) {
     const trimmed = line.trim()
-    if (!trimmed || trimmed.length < 8) continue
+    if (!trimmed || trimmed.length < 6) continue
 
-    const dateMatch = trimmed.match(datePattern)
-    if (!dateMatch) continue
+    // Find a date
+    let dateStr: string | null = null
+    let dateIndex = -1
+    let dateLen = 0
+    let isShort = false
 
-    const amounts = trimmed.match(amountPattern)
-    if (!amounts || amounts.length === 0) continue
+    for (const { re, short } of DATE_PATTERNS) {
+      const m = trimmed.match(re)
+      if (m && m.index !== undefined) {
+        dateStr = m[0]
+        dateIndex = m.index
+        dateLen = m[0].length
+        isShort = short
+        break
+      }
+    }
+    if (!dateStr) continue
 
-    // Use the last amount found (usually the transaction amount, not running balance)
-    const rawAmount = amounts[amounts.length - 1]
-    const isCR = /CR$/i.test(rawAmount)
-    const isDR = /DR$/i.test(rawAmount)
-    const numStr = rawAmount.replace(/[$,\s]|CR|DR/gi, "")
-    let amount = parseFloat(numStr)
-    if (isNaN(amount) || amount === 0) continue
+    // Parse date to ISO
+    const isoDate = isShort
+      ? parseShortDate(dateStr, stmtYear)
+      : parseDate(dateStr)
+    if (!isoDate) continue
 
-    // Credits are positive (income), debits are negative (expense)
-    if (isDR) amount = -Math.abs(amount)
-    if (isCR) amount = Math.abs(amount)
+    // Find all amounts
+    const amountMatches = [...trimmed.matchAll(AMOUNT_RE)]
+    if (amountMatches.length === 0) continue
 
-    const date = parseDate(dateMatch[0])
-    if (!date) continue
+    // Parse each raw amount token
+    const parsedAmounts = amountMatches.map((m) => {
+      const raw = m[0]
+      const hasCR = /CR$/i.test(raw.trim())
+      const hasDR = /DR$/i.test(raw.trim())
+      const hasTrailingMinus = /[-]\s*$/.test(raw.trim())
+      const numStr = raw.replace(/[$,\s]|CR|DR/gi, "").replace(/[-+]$/, "").trim()
+      return { value: parseFloat(numStr), hasCR, hasDR, hasTrailingMinus, index: m.index! }
+    }).filter((a) => !isNaN(a.value) && a.value > 0)
 
-    // Extract description: text after the date, before the amounts
-    const dateEnd = (dateMatch.index ?? 0) + dateMatch[0].length
-    const amountStart = trimmed.lastIndexOf(rawAmount)
-    const rawDesc = trimmed.slice(dateEnd, amountStart > dateEnd ? amountStart : undefined).trim()
-    const description = cleanDescription(rawDesc || trimmed.slice(0, dateEnd))
-    if (!description) continue
+    if (parsedAmounts.length === 0) continue
 
-    transactions.push({
-      date,
-      description,
-      amount,
-      merchant: extractMerchant(description),
+    // When 2+ amounts: treat last as running balance, second-to-last as transaction amount
+    // When 1 amount: it's the transaction amount (no balance)
+    let txEntry: typeof parsedAmounts[0]
+    let balance: number | null = null
+
+    if (parsedAmounts.length >= 2) {
+      txEntry = parsedAmounts[parsedAmounts.length - 2]
+      balance = parsedAmounts[parsedAmounts.length - 1].value
+    } else {
+      txEntry = parsedAmounts[0]
+    }
+
+    // Extract description between date end and first amount
+    const descStart = dateIndex + dateLen
+    const firstAmtIdx = parsedAmounts[0].index
+    let description = trimmed
+      .slice(descStart, firstAmtIdx > descStart ? firstAmtIdx : undefined)
+      .trim()
+      .replace(/\s+/g, " ")
+
+    if (description.length < 2) {
+      // Fallback: everything after the last amount
+      const lastAmt = parsedAmounts[parsedAmounts.length - 1]
+      description = trimmed.slice(lastAmt.index + lastAmt.value.toString().length).trim()
+    }
+    if (description.length < 2) continue
+
+    raw.push({
+      date: isoDate,
+      description: cleanDescription(description),
+      txAmount: txEntry.value,
+      balance,
+      hasCR: txEntry.hasCR,
+      hasDR: txEntry.hasDR,
+      hasTrailingMinus: txEntry.hasTrailingMinus,
     })
   }
 
-  // Deduplicate by date+description+amount to handle multi-column PDF layouts
+  // Determine sign using running balance deltas; fall back to keyword heuristics
+  const result: ParsedTransaction[] = []
+  let prevBalance: number | null = null
+
+  for (const entry of raw) {
+    let amount: number
+
+    if (entry.hasCR) {
+      amount = entry.txAmount  // explicit credit → income
+    } else if (entry.hasDR || entry.hasTrailingMinus) {
+      amount = -entry.txAmount // explicit debit → expense
+    } else if (entry.balance !== null && prevBalance !== null) {
+      // Infer from balance movement
+      amount = entry.balance > prevBalance ? entry.txAmount : -entry.txAmount
+    } else {
+      // Fall back to keyword heuristic
+      amount = isIncomeByKeyword(entry.description) ? entry.txAmount : -entry.txAmount
+    }
+
+    if (entry.balance !== null) prevBalance = entry.balance
+
+    result.push({
+      date: entry.date,
+      description: entry.description,
+      amount,
+      merchant: extractMerchant(entry.description),
+    })
+  }
+
+  // Deduplicate
   const seen = new Set<string>()
-  return transactions.filter((t) => {
+  return result.filter((t) => {
     const key = `${t.date}|${t.description}|${t.amount}`
     if (seen.has(key)) return false
     seen.add(key)
