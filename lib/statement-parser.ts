@@ -298,158 +298,205 @@ function parseShortDate(dateStr: string, year: number): string | null {
 /**
  * Parse a PDF bank statement.
  *
- * Strategy:
- * 1. Extract all lines that contain a recognisable date + at least one dollar amount.
- * 2. When a line has 2+ amounts the LAST is treated as the running balance,
- *    the SECOND-TO-LAST as the transaction amount.  When only 1 amount is found
- *    it is the transaction amount (no balance column, or balance was on separate line).
- * 3. Transaction direction (income vs expense) is inferred from consecutive
- *    balance deltas.  When that's not available we fall back to keyword matching.
+ * Handles two formats:
+ *
+ * A) Spaced format (TD, RBC, CIBC, most others):
+ *    "Jan 15  Tim Hortons  4.50  995.50"
+ *
+ * B) Concatenated format (Scotiabank PDFs extracted by pdf-parse):
+ *    "Dec17Fees/dues33.89958.24"
+ *    Year changes appear as standalone lines: "2025", "2026"
+ *    Merchant details sometimes appear on the following line.
+ *
+ * Strategy for both:
+ * 1. Track current year from standalone year lines.
+ * 2. Match lines that start with {MonthAbbr}{Day} (concatenated) or contain
+ *    a spaced date pattern.
+ * 3. Extract all dollar amounts from the remainder; second-to-last = tx amount,
+ *    last = running balance.
+ * 4. Skip OpeningBalance / ClosingBalance; use opening balance to seed prevBalance.
+ * 5. Infer income vs expense from balance delta; fall back to keyword heuristic.
  */
 export function parsePDFStatement(text: string): ParsedTransaction[] {
   const lines = text.replace(/\r\n/g, "\n").split("\n")
-  const currentYear = new Date().getFullYear()
 
-  // Try to detect the statement year from a 4-digit year in the first 800 chars
-  const yearMatch = text.slice(0, 800).match(/\b(20\d{2})\b/)
-  const stmtYear = yearMatch ? parseInt(yearMatch[1]) : currentYear
+  // Matches a line that STARTS with a concatenated date like "Dec17" or "Jan2"
+  const CONCAT_DATE_RE = /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s*(\d{1,2})(.*)/i
+  // Matches a spaced/separated date anywhere in a line
+  const SPACED_DATE_RE =
+    /\b((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{4}-\d{2}-\d{2})\b/i
+  // Standalone year line
+  const YEAR_RE = /^(20\d{2})$/
+  // All dollar-like amounts including negative balances
+  const AMOUNT_RE = /-?\d{1,3}(?:,\d{3})*\.\d{2}/g
 
-  // All date patterns, ordered most-specific first
-  const DATE_PATTERNS: Array<{ re: RegExp; short: boolean }> = [
-    { re: /\b(\d{4}-\d{2}-\d{2})\b/, short: false },
-    { re: /\b(\d{1,2}\/\d{1,2}\/\d{2,4})\b/, short: false },
-    { re: /\b(\d{1,2}-\d{1,2}-\d{4})\b/, short: false },
-    {
-      re: /\b((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2},?\s+\d{4})\b/i,
-      short: false,
-    },
-    {
-      re: /\b(\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?),?\s+\d{4})\b/i,
-      short: false,
-    },
-    // Short dates (no year) — common in Scotiabank, TD, RBC statements
-    {
-      re: /\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2})\b/i,
-      short: true,
-    },
-    { re: /\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))\b/i, short: true },
-    { re: /\b(\d{2}\/\d{2})\b/, short: true },
-  ]
-
-  // Matches a money amount: optional $, digits with optional commas, decimal cents,
-  // optional trailing - or + or CR/DR suffix.
-  const AMOUNT_RE = /\$?\s*[\d,]+\.\d{2}\s*(?:[-+]|CR|DR)?/gi
+  let currentYear = new Date().getFullYear()
+  // Try to pre-seed year from the first 800 chars
+  const earlyYear = text.slice(0, 800).match(/\b(20\d{2})\b/)
+  if (earlyYear) currentYear = parseInt(earlyYear[1])
 
   interface RawEntry {
     date: string
     description: string
-    txAmount: number        // transaction amount (always positive here)
-    balance: number | null  // running balance if available
-    hasCR: boolean          // explicit credit indicator
-    hasDR: boolean          // explicit debit indicator
-    hasTrailingMinus: boolean
+    txAmount: number
+    balance: number | null
   }
 
   const raw: RawEntry[] = []
+  let openingBalance: number | null = null
+  let lastRaw: RawEntry | null = null
 
   for (const line of lines) {
     const trimmed = line.trim()
-    if (!trimmed || trimmed.length < 6) continue
+    if (!trimmed) continue
 
-    // Find a date
-    let dateStr: string | null = null
-    let dateIndex = -1
-    let dateLen = 0
-    let isShort = false
+    // Standalone year line — update tracker
+    if (YEAR_RE.test(trimmed)) {
+      currentYear = parseInt(trimmed)
+      continue
+    }
 
-    for (const { re, short } of DATE_PATTERNS) {
-      const m = trimmed.match(re)
-      if (m && m.index !== undefined) {
-        dateStr = m[0]
-        dateIndex = m.index
-        dateLen = m[0].length
-        isShort = short
-        break
+    // ── Try concatenated format first (Scotiabank) ───────────────────────
+    const concatMatch = trimmed.match(CONCAT_DATE_RE)
+    if (concatMatch) {
+      const monthStr = concatMatch[1].toLowerCase().replace(/\.$/, "")
+      const day = parseInt(concatMatch[2])
+      const rest = concatMatch[3]
+      const monthNum = MONTH_MAP[monthStr]
+      if (!monthNum) continue
+
+      const isoDate = `${currentYear}-${String(monthNum).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+      const restLower = rest.toLowerCase()
+
+      // Capture opening balance; skip both open/close lines
+      if (restLower.includes("openingbalance") || restLower.startsWith("opening")) {
+        const amts = [...rest.matchAll(AMOUNT_RE)]
+        if (amts.length > 0) {
+          openingBalance = parseFloat(amts[amts.length - 1][0].replace(/,/g, ""))
+        }
+        continue
+      }
+      if (restLower.includes("closingbalance") || restLower.startsWith("closing")) continue
+
+      const amtMatches = [...rest.matchAll(AMOUNT_RE)]
+      if (amtMatches.length === 0) continue
+
+      const amounts = amtMatches.map((m) => parseFloat(m[0].replace(/,/g, "")))
+      const txAmount = Math.abs(amounts.length >= 2 ? amounts[amounts.length - 2] : amounts[0])
+      const balance = amounts.length >= 2 ? amounts[amounts.length - 1] : null
+
+      // Description = text before the first amount
+      const firstAmtIdx = amtMatches[0].index!
+      let description = rest.slice(0, firstAmtIdx).trim()
+      if (description.length < 2) description = rest.slice(0, 40).replace(/[\d.,]+$/, "").trim()
+      if (description.length < 2) continue
+
+      const entry: RawEntry = { date: isoDate, description: cleanDescription(description), txAmount, balance }
+      raw.push(entry)
+      lastRaw = entry
+      continue
+    }
+
+    // ── Try spaced / standard format ─────────────────────────────────────
+    const spacedMatch = trimmed.match(SPACED_DATE_RE)
+    if (spacedMatch && spacedMatch.index !== undefined) {
+      const dateStr = spacedMatch[0]
+      const dateEnd = spacedMatch.index + dateStr.length
+      const rest = trimmed.slice(dateEnd).trim()
+
+      // Parse ISO date
+      let isoDate: string | null = null
+      // YYYY-MM-DD
+      const iso = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+      if (iso) isoDate = dateStr
+      // MM/DD/YYYY or MM/DD/YY
+      const slashFull = dateStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/)
+      if (slashFull) {
+        let y = parseInt(slashFull[3]); if (y < 100) y += 2000
+        isoDate = `${y}-${slashFull[1].padStart(2,"0")}-${slashFull[2].padStart(2,"0")}`
+      }
+      // MM/DD (no year)
+      const slashShort = dateStr.match(/^(\d{1,2})\/(\d{1,2})$/)
+      if (slashShort) {
+        isoDate = `${currentYear}-${slashShort[1].padStart(2,"0")}-${slashShort[2].padStart(2,"0")}`
+      }
+      // "Jan 15 2025" or "Jan 15"
+      const monthFirst = dateStr.match(
+        /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?/i
+      )
+      if (monthFirst) {
+        const mn = MONTH_MAP[monthFirst[1].toLowerCase()]
+        const dy = parseInt(monthFirst[2])
+        const yr = monthFirst[3] ? parseInt(monthFirst[3]) : currentYear
+        if (mn) isoDate = `${yr}-${String(mn).padStart(2,"0")}-${String(dy).padStart(2,"0")}`
+      }
+
+      if (!isoDate) continue
+
+      const restLower = rest.toLowerCase()
+      if (restLower.includes("opening balance")) {
+        const amts = [...rest.matchAll(AMOUNT_RE)]
+        if (amts.length > 0) openingBalance = parseFloat(amts[amts.length - 1][0].replace(/,/g, ""))
+        continue
+      }
+      if (restLower.includes("closing balance")) continue
+
+      const amtMatches = [...rest.matchAll(AMOUNT_RE)]
+      if (amtMatches.length === 0) continue
+
+      const amounts = amtMatches.map((m) => parseFloat(m[0].replace(/,/g, "")))
+      const txAmount = Math.abs(amounts.length >= 2 ? amounts[amounts.length - 2] : amounts[0])
+      const balance = amounts.length >= 2 ? amounts[amounts.length - 1] : null
+
+      const firstAmtIdx = amtMatches[0].index!
+      let description = rest.slice(0, firstAmtIdx).trim().replace(/\s+/g, " ")
+      if (description.length < 2) continue
+
+      // Check for explicit CR/DR suffixes on the tx amount token
+      const txToken = amtMatches.length >= 2 ? amtMatches[amtMatches.length - 2][0] : amtMatches[0][0]
+      const hasCR = /CR$/i.test(txToken.trim())
+      const hasDR = /DR$/i.test(txToken.trim()) || /[-]\s*$/.test(txToken.trim())
+
+      const entry: RawEntry & { hasCR?: boolean; hasDR?: boolean } = {
+        date: isoDate,
+        description: cleanDescription(description),
+        txAmount,
+        balance,
+      }
+      // Stash CR/DR hints for direction logic below
+      ;(entry as Record<string, unknown>).hasCR = hasCR
+      ;(entry as Record<string, unknown>).hasDR = hasDR
+
+      raw.push(entry)
+      lastRaw = entry
+      continue
+    }
+
+    // ── Continuation line (merchant details on the next row) ─────────────
+    if (lastRaw && /^[A-Za-z]/.test(trimmed) && !/\d/.test(trimmed) && trimmed.length > 3) {
+      // Append to description if it looks like a merchant/location string
+      if (!lastRaw.description.toLowerCase().includes(trimmed.toLowerCase())) {
+        lastRaw.description = cleanDescription(`${lastRaw.description} ${trimmed}`)
       }
     }
-    if (!dateStr) continue
-
-    // Parse date to ISO
-    const isoDate = isShort
-      ? parseShortDate(dateStr, stmtYear)
-      : parseDate(dateStr)
-    if (!isoDate) continue
-
-    // Find all amounts
-    const amountMatches = [...trimmed.matchAll(AMOUNT_RE)]
-    if (amountMatches.length === 0) continue
-
-    // Parse each raw amount token
-    const parsedAmounts = amountMatches.map((m) => {
-      const raw = m[0]
-      const hasCR = /CR$/i.test(raw.trim())
-      const hasDR = /DR$/i.test(raw.trim())
-      const hasTrailingMinus = /[-]\s*$/.test(raw.trim())
-      const numStr = raw.replace(/[$,\s]|CR|DR/gi, "").replace(/[-+]$/, "").trim()
-      return { value: parseFloat(numStr), hasCR, hasDR, hasTrailingMinus, index: m.index! }
-    }).filter((a) => !isNaN(a.value) && a.value > 0)
-
-    if (parsedAmounts.length === 0) continue
-
-    // When 2+ amounts: treat last as running balance, second-to-last as transaction amount
-    // When 1 amount: it's the transaction amount (no balance)
-    let txEntry: typeof parsedAmounts[0]
-    let balance: number | null = null
-
-    if (parsedAmounts.length >= 2) {
-      txEntry = parsedAmounts[parsedAmounts.length - 2]
-      balance = parsedAmounts[parsedAmounts.length - 1].value
-    } else {
-      txEntry = parsedAmounts[0]
-    }
-
-    // Extract description between date end and first amount
-    const descStart = dateIndex + dateLen
-    const firstAmtIdx = parsedAmounts[0].index
-    let description = trimmed
-      .slice(descStart, firstAmtIdx > descStart ? firstAmtIdx : undefined)
-      .trim()
-      .replace(/\s+/g, " ")
-
-    if (description.length < 2) {
-      // Fallback: everything after the last amount
-      const lastAmt = parsedAmounts[parsedAmounts.length - 1]
-      description = trimmed.slice(lastAmt.index + lastAmt.value.toString().length).trim()
-    }
-    if (description.length < 2) continue
-
-    raw.push({
-      date: isoDate,
-      description: cleanDescription(description),
-      txAmount: txEntry.value,
-      balance,
-      hasCR: txEntry.hasCR,
-      hasDR: txEntry.hasDR,
-      hasTrailingMinus: txEntry.hasTrailingMinus,
-    })
   }
 
-  // Determine sign using running balance deltas; fall back to keyword heuristics
+  // ── Determine sign using running balance deltas ───────────────────────
   const result: ParsedTransaction[] = []
-  let prevBalance: number | null = null
+  let prevBalance = openingBalance
 
   for (const entry of raw) {
+    const hasCR = (entry as Record<string, unknown>).hasCR as boolean | undefined
+    const hasDR = (entry as Record<string, unknown>).hasDR as boolean | undefined
     let amount: number
 
-    if (entry.hasCR) {
-      amount = entry.txAmount  // explicit credit → income
-    } else if (entry.hasDR || entry.hasTrailingMinus) {
-      amount = -entry.txAmount // explicit debit → expense
+    if (hasCR) {
+      amount = entry.txAmount
+    } else if (hasDR) {
+      amount = -entry.txAmount
     } else if (entry.balance !== null && prevBalance !== null) {
-      // Infer from balance movement
       amount = entry.balance > prevBalance ? entry.txAmount : -entry.txAmount
     } else {
-      // Fall back to keyword heuristic
       amount = isIncomeByKeyword(entry.description) ? entry.txAmount : -entry.txAmount
     }
 
