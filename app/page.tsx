@@ -140,10 +140,34 @@ async function getDashboardData(userId: string, selectedMonth?: string) {
 
 export default async function DashboardPage({ searchParams }: PageProps) {
   const params = await searchParams
+
+  // Guard against missing Supabase env vars (shows a helpful error instead of crashing)
+  if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background p-6">
+        <div className="max-w-md rounded-lg border border-border bg-card p-8 shadow-sm">
+          <h1 className="mb-2 text-xl font-semibold text-foreground">Setup Required</h1>
+          <p className="mb-4 text-sm text-muted-foreground">
+            Supabase environment variables are not configured. Add the following to your Vercel
+            project settings under <strong>Environment Variables</strong>:
+          </p>
+          <ul className="space-y-1 rounded-md bg-muted p-3 font-mono text-xs text-foreground">
+            <li>NEXT_PUBLIC_SUPABASE_URL</li>
+            <li>NEXT_PUBLIC_SUPABASE_ANON_KEY</li>
+          </ul>
+          <p className="mt-4 text-xs text-muted-foreground">
+            Find these values in your Supabase project → Settings → API.
+            Redeploy after adding them.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
   const supabase = await createClient()
-  
+
   const { data: { user } } = await supabase.auth.getUser()
-  
+
   if (!user) {
     redirect("/auth/login")
   }

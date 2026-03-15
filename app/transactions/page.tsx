@@ -21,6 +21,11 @@ interface PageProps {
 
 export default async function TransactionsPage({ searchParams }: PageProps) {
   const params = await searchParams
+
+  if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
+    redirect("/")
+  }
+
   const supabase = await createClient()
 
   const { data: { user } } = await supabase.auth.getUser()
